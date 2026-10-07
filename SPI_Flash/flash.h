@@ -22,8 +22,16 @@
 #define CACHE_SECTOR_SIZE   4096
 #define CACHE_ENTRY_SIZE    128
 
-#define MAGIC_VALID         0xDEADBEEF
-#define MAGIC_EMPTY         0xFFFFFFFF
+/* 缓存条目魔数（三态，必须满足"只能清位"的单向链）
+ * NOR Flash 擦除态是全 1，写入只能把 1 变成 0，永远不能把 0 变回 1。
+ * 因此状态之间必须满足：新值 == 旧值 & 新值。
+ *   0xFFFFFFFF(空槽) --清位--> 0xDEADBEEF(待补传) --清位--> 0x00000000(已补传/逻辑擦除)
+ * 要回到 0xFFFFFFFF 只能靠整扇区物理擦除。
+ * 逻辑擦除：补传成功后写 CACHE_MAGIC_SENT，不用擦扇区（原写法 0xFFFFFFFF 物理不可达，
+ *           等于"标记已补传"从未生效，重启后会把历史数据重复补传一遍）。*/
+#define CACHE_MAGIC_EMPTY    0xFFFFFFFFU   // 槽位空（物理擦除态，还没写过）
+#define CACHE_MAGIC_PENDING  0xDEADBEEFU   // 断网缓存已写入，等待补传
+#define CACHE_MAGIC_SENT     0x00000000U   // 补传完成 → 逻辑擦除
 
 #define LOG_CONTENT_LEN     64U    // 单条日志内容最大长度
 #define LOG_MAGIC           0x55AAU // 有效日志魔数

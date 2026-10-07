@@ -59,6 +59,59 @@ static uint32_t read_addr  = CACHE_START_ADDR;
 static uint8_t  initialized = 0;
 
 
+/* ==================== 缓存条目内部操作（必须在持有 flash_mutex 时调用）==================== */
+
+static void cache_read_entry(CacheEntry_t *e, uint32_t addr)
+{
+    SPI_FLASH_BufferRead((uint8_t *)e, addr, sizeof(CacheEntry_t));
+}
+
+/*
+ * 断网补传：把读指针推进到下一条"待补传"(CACHE_MAGIC_PENDING)条目。
+ * 必须能跳过"已逻辑擦除"(0x00000000) 的槽 —— 否则重启后扫描会在第一个已补传的槽上停住，
+ * 后面没补传的数据就再也读不到了。
+ * 返回 1 = 找到（read_addr 指向它）；0 = 没有待补传数据（read_addr 已对齐写指针）。
+ */
+static int cache_advance_to_pending(void)
+{
+    CacheEntry_t e;
+    while (read_addr < write_addr) {
+        cache_read_entry(&e, read_addr);
+        if (e.magic == CACHE_MAGIC_PENDING) return 1;
+        read_addr += sizeof(CacheEntry_t);
+    }
+    read_addr = write_addr;
+    return 0;
+}
+
+/*
+ * 断点续写：定位可写槽位。
+ * 乐观假设（本项目前提）：缓存区不会写满 —— 断网期间缓存的数据量远小于 4MB，
+ * 联网后就会被补传干净。所以"槽被占用"只可能出现在写指针已经绕回上一圈的场景，
+ * 此时整扇区擦掉直接复用即可，不需要逐条读出来判断扇区里是否还压着待补传数据。
+ * - 槽是空的 → 直接用（正常顺序写，不产生任何擦除）
+ * - 槽被占用 → 整扇区擦除后复用
+ * 注意：write_addr 恒为 128 字节对齐，且 4096 % 128 == 0，
+ *       所以它必定落在扇区内某条槽的起始处。
+ */
+static void cache_alloc_slot(void)
+{
+    CacheEntry_t e;
+
+    if (write_addr + sizeof(CacheEntry_t) > CACHE_END_ADDR) {
+        write_addr = CACHE_START_ADDR;                  /* 到分区尾，回绕 */
+    }
+
+    cache_read_entry(&e, write_addr);
+    if (e.magic == CACHE_MAGIC_EMPTY) {
+        return;                                         /* 空槽，直接写，不产生擦除 */
+    }
+
+    /* 槽被占用：整扇区擦除后复用 */
+    SPI_FLASH_SectorErase(write_addr & ~(CACHE_SECTOR_SIZE - 1U));
+}
+
+
 /**
  * @brief  分区读数据
  * @param  part_base 分区基地址
@@ -204,29 +257,31 @@ void Log_EraseAll(void)
 */
 void FlashCache_Init(void)
 {
-	
 	 log_write_offset = 0;  //开机默认从日志分区0地址开始写
 	 log_erased_upto  = 0;		//开机从0开始写，覆盖前必须先擦除
-    CacheEntry_t entry;
-    uint32_t addr = CACHE_START_ADDR;
 
-    write_addr = CACHE_START_ADDR;
-    while (addr < CACHE_END_ADDR) {
-        SPI_FLASH_BufferRead((uint8_t *)&entry, addr, sizeof(CacheEntry_t));
-			//如果数据有效 继续往下读
-        if (entry.magic == MAGIC_VALID) {
-            write_addr = addr + sizeof(CacheEntry_t);
-        } else {
+    /* 本函数在调度器启动前调用（单任务），不取锁 */
+    CacheEntry_t entry;
+    uint32_t addr;
+
+    /* 断点续写：顺序扫描，跳过"已逻辑擦除"的槽，定位第一条真正的空槽。
+     * 空槽判据必须是 0xFFFFFFFF（物理擦除态），不能用"不等于待补传"来判断。 */
+    write_addr = CACHE_END_ADDR;
+    for (addr = CACHE_START_ADDR; addr + sizeof(CacheEntry_t) <= CACHE_END_ADDR; addr += sizeof(CacheEntry_t)) {
+        cache_read_entry(&entry, addr);
+        if (entry.magic == CACHE_MAGIC_EMPTY) {
+            write_addr = addr;
             break;
         }
-        addr += sizeof(CacheEntry_t);
     }
-
     if (write_addr >= CACHE_END_ADDR) {
-        write_addr = CACHE_START_ADDR;
+        write_addr = CACHE_START_ADDR;              /* 整片写满，回绕复用 */
     }
 
+    /* 断网补传：读指针定位到第一条待补传数据，没有则对齐写指针 */
     read_addr = CACHE_START_ADDR;
+    (void)cache_advance_to_pending();
+
     initialized = 1;
 }
 
@@ -238,26 +293,25 @@ int FlashCache_Write(const char *json, uint16_t len)
     if (flash_mutex == NULL) return -3;
 
     CacheEntry_t entry;
-    memset(&entry, 0xFF, sizeof(entry));		//擦除为1111
-    entry.magic     = MAGIC_VALID;
+    memset(&entry, 0xFF, sizeof(entry));        //先铺成物理擦除态，magic 故意先留 0xFFFFFFFF
     entry.timestamp = HAL_GetTick();
     entry.data_len  = len;
     memcpy(entry.data, json, len);
 
     flash_lock();
 
-    // --- 环形回绕处理 ---
-    if ((write_addr + sizeof(CacheEntry_t)) >= CACHE_END_ADDR) {   // 到达 8MB 边界
-        write_addr = CACHE_START_ADDR;    // 回绕到 4MB
-    }
+    cache_alloc_slot();                         //断点续写：找到一个真正可写的空槽
 
-    // --- 扇区首地址擦除（回绕后 CACHE_START_ADDR 也是扇区首地址，只擦一次）---
-    if (write_addr % CACHE_SECTOR_SIZE == 0) {  // 写指针刚好在扇区边界
-        SPI_FLASH_SectorErase(write_addr);      // 擦除整个 4KB 扇区
-    }
-
+    /* 阶段 1：写整条。此刻 magic 仍是空槽态(0xFFFFFFFF)，若在阶段 2 之前断电，
+     * 只会留下一个"空槽"，不会污染出半截数据。 */
     SPI_FLASH_BufferWrite((uint8_t *)&entry, write_addr, sizeof(CacheEntry_t));
-    write_addr += sizeof(CacheEntry_t);	//固定128
+
+    /* 阶段 2：单独把 magic 置为"待补传"。
+     * 0xFFFFFFFF -> 0xDEADBEEF 全程只把 1 清成 0，NOR Flash 物理可写成立。 */
+    uint32_t pending = CACHE_MAGIC_PENDING;
+    SPI_FLASH_BufferWrite((uint8_t *)&pending, write_addr, sizeof(pending));
+
+    write_addr += sizeof(CacheEntry_t);         //固定128
 
     flash_unlock();
     return 0;
@@ -271,26 +325,22 @@ int FlashCache_ReadAndConsume(char *json, uint16_t *len)
     flash_lock();
 
     int ret = 0;
-    CacheEntry_t entry;
+    if (cache_advance_to_pending()) {
+        CacheEntry_t entry;
+        cache_read_entry(&entry, read_addr);
 
-    if (read_addr >= write_addr) {
-        ret = -2; // 没有新数据
+        memcpy(json, entry.data, entry.data_len);
+        json[entry.data_len] = '\0';
+        *len = entry.data_len;
+
+        /* 逻辑擦除：0xDEADBEEF -> 0x00000000 只清位，不需要擦扇区 */
+        entry.magic = CACHE_MAGIC_SENT;
+        SPI_FLASH_WriteEnable();
+        SPI_FLASH_BufferWrite((uint8_t *)&entry, read_addr, sizeof(CacheEntry_t));
+
+        read_addr += sizeof(CacheEntry_t);
     } else {
-        SPI_FLASH_BufferRead((uint8_t *)&entry, read_addr, sizeof(CacheEntry_t));
-        if (entry.magic != MAGIC_VALID) {
-            read_addr = write_addr;     // 坏条目：跳过剩余
-            ret = -2;
-        } else {
-            memcpy(json, entry.data, entry.data_len);
-            json[entry.data_len] = '\0';
-            *len = entry.data_len;
-
-            // 直接清空这条，防止重复读（最安全）
-            entry.magic = MAGIC_EMPTY;
-            SPI_FLASH_WriteEnable();
-            SPI_FLASH_BufferWrite((uint8_t *)&entry, read_addr, sizeof(CacheEntry_t));
-            read_addr += sizeof(CacheEntry_t);
-        }
+        ret = -2;                               // 没有待补传数据
     }
 
     flash_unlock();
@@ -305,7 +355,8 @@ int FlashCache_HasData(void)
     if (!initialized || flash_mutex == NULL) return 0;
 
     flash_lock();
-    int has = (read_addr < write_addr);		// 读指针落后写指针，说明有数据
+    /* 顺带把读指针推过"已逻辑擦除"的槽，永远指向第一条待补传数据 */
+    int has = cache_advance_to_pending();
     flash_unlock();
 
     return has;
@@ -313,7 +364,7 @@ int FlashCache_HasData(void)
 
 /*读指针追上写指针：放弃剩余缓存（仅数据损坏时用）。
  * 不能把 write_addr 一起拉回起点：那样后续写入会直接覆盖还没补传的数据，
- * 且起点残留的旧条目 MAGIC_VALID 还在，下次开机会被当成有效数据重复补传。*/
+ * 且起点残留的旧条目 CACHE_MAGIC_PENDING 还在，下次开机会被当成待补传数据重复补传。*/
 void my_clear(void)
 {
     flash_lock();
@@ -385,11 +436,13 @@ void FlashCache_MarkSent(void)
     uint32_t cur = read_addr - sizeof(CacheEntry_t);
     if (cur >= CACHE_START_ADDR) {
         CacheEntry_t entry;
-        SPI_FLASH_BufferRead((uint8_t *)&entry, cur, sizeof(CacheEntry_t));
-        if (entry.magic == MAGIC_VALID) {
-            entry.magic = MAGIC_EMPTY; // 只改魔数 不擦除扇区 标记已补传 下次不会再补传
+        cache_read_entry(&entry, cur);
+        if (entry.magic == CACHE_MAGIC_PENDING) {
+            /* 逻辑擦除：0xDEADBEEF -> 0x00000000 全是 1->0，物理可写成立。
+             * （原来写 0xFFFFFFFF 需要 0->1，芯片根本写不进去，等于标记从未生效）*/
+            entry.magic = CACHE_MAGIC_SENT;
             SPI_FLASH_WriteEnable();			 // SPI Flash 写使能（硬件要求，写操作前必须开启）
-            SPI_FLASH_BufferWrite((uint8_t *)&entry, cur, sizeof(CacheEntry_t));			  // 把修改后的条目写回 Flash
+            SPI_FLASH_BufferWrite((uint8_t *)&entry, cur, sizeof(CacheEntry_t));			  // 只改魔数，不擦扇区
         }
     }
 
@@ -404,21 +457,16 @@ int FlashCache_Read(char *json, uint16_t *len)
     flash_lock();
 
     int ret = 0;
-    CacheEntry_t entry;
+    if (cache_advance_to_pending()) {           //跳过已补传的槽，找下一条待补传数据
+        CacheEntry_t entry;
+        cache_read_entry(&entry, read_addr);
 
-    if (read_addr >= write_addr) {
-        ret = -2;                                   // 没有新数据
+        memcpy(json, entry.data, entry.data_len);
+        json[entry.data_len] = '\0';
+        *len = entry.data_len;
+        read_addr += sizeof(CacheEntry_t);//128
     } else {
-        SPI_FLASH_BufferRead((uint8_t *)&entry, read_addr, sizeof(CacheEntry_t));
-        if (entry.magic != MAGIC_VALID) {			/*只补传 这个值MAGIC_VALID*/
-            read_addr = write_addr;                 // 坏条目：读指针追上写指针
-            ret = -2;
-        } else {
-            memcpy(json, entry.data, entry.data_len);
-            json[entry.data_len] = '\0';
-            *len = entry.data_len;
-            read_addr += sizeof(CacheEntry_t);//128
-        }
+        ret = -2;                               // 没有待补传数据
     }
 
     flash_unlock();
