@@ -17,15 +17,61 @@ extern uint8_t a[256];
 /* ESP8266 uart1 波特率115200 DMA空闲中断*/
 //+++正确退出透传后 下一条语句就不会输出error
 
+/* 两次软复位的最小间隔：避免"复位 -> 必然失败 -> 再复位"的自激循环 */
+#define ESP_RESET_MIN_INTERVAL_MS  60000U
+/* AT+RST 后等待模块重启并重新关联热点 */
+#define ESP_RESET_WAIT_MS          6000U
+
+/* 探测模块是否处于命令模式（能响应 AT） */
+static int ESP_ProbeCmdMode(uint32_t timeout_ms)
+{
+    return ESP_SendCmd_OK("AT\r\n", timeout_ms) == ESP_OK;
+}
+
+/*
+ * 把 ESP8266 恢复到已知可用的命令模式。
+ * ESP8266 的状态独立于 STM32：MCU 复位和重新烧录都不会影响它，
+ * 只有 AT+RST 软复位（或整板断电）才能清掉卡死的透传模式 / 僵尸 TCP 连接。
+ */
+static void ESP_RecoverToCmdMode(void)
+{
+    static uint32_t last_reset_tick = 0;
+    static uint8_t  ever_reset = 0;
+
+    /* 1. 能回 AT 说明本来就在命令模式。
+     *    此时绝不能发 "+++"：它不是转义序列而只是三个普通字符，
+     *    会留在模块命令行缓冲里，把随后的指令变成 "+++AT" 而返回 ERROR。*/
+    if (ESP_ProbeCmdMode(1000)) return;
+
+    /* 2. 无响应：可能正处于透传模式，发 "+++" 退出后再探测 */
+    HAL_UART_Transmit(&huart1, (uint8_t *)"+++\r\n", 3, 100);
+    vTaskDelay(1000);
+    if (ESP_ProbeCmdMode(1000)) return;
+
+    /* 3. 仍无响应：软复位模块（带节流，防止复位风暴） */
+    if (ever_reset && (HAL_GetTick() - last_reset_tick) < ESP_RESET_MIN_INTERVAL_MS)
+    {
+        Log_Write(LOG_WARN, "ESP reset throttled");
+        return;
+    }
+    ever_reset = 1;
+    last_reset_tick = HAL_GetTick();
+
+    HAL_UART_Transmit(&huart1, (uint8_t *)"AT+RST\r\n", 8, 100);
+    Log_Write(LOG_WARN, "ESP soft reset");
+    vTaskDelay(pdMS_TO_TICKS(ESP_RESET_WAIT_MS));
+    (void)ESP_ProbeCmdMode(2000);
+}
+
 /* ==================== 连接 ESP8266 并完成 MQTT 会话 ====================
  * 首连 (MQTT_Init) 与断线重连 (RE_MQTT_Init) 共用本函数，保证两条路径行为一致。
  * 返回 1 成功（已订阅主题），0 失败。
  */
 static int MQTT_ConnectOnce(void)
 {
-    /* 1. 退出透传模式（若模块正在透传，AT 指令不会被识别） */
-    HAL_UART_Transmit(&huart1, (uint8_t *)"+++\r\n", 3, 100);
-    vTaskDelay(1000);
+    /* 1. 把模块恢复到命令模式，否则后面的 AT 指令会被当成透传数据发给 socket */
+    ESP_RecoverToCmdMode();
+    vTaskDelay(500);
 
     /* 2. 等待 ESP8266 就绪：刚复位或刚上电时模块可能尚未启动完成 */
     int ready = 0;
@@ -49,13 +95,24 @@ static int MQTT_ConnectOnce(void)
     }
     vTaskDelay(500);
 
-    /* 5. 建立到巴法云的 TCP 连接 */
+    /* 5. 建立到巴法云的 TCP 连接。
+     * 期望应答必须是 "OK" 而不是 "CONNECT"：模块里若残留旧连接，
+     * 它回的是 "ALREADY CONNECTED"（含子串 CONNECT）会被误判成建连成功，
+     * 于是每次重试都复用在一条死 socket 上，永远拿不到 CONNACK。
+     * 成功路径 CONNECT\r\n\r\nOK 用 "OK" 同样能匹配，
+     * "ALREADY CONNECTED\r\n\r\nERROR" 则会被正确判为失败。*/
     char tcp_cmd[64];
     sprintf(tcp_cmd, "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", BEMFA_BROKER, BEMFA_PORT);
-    if (ESP_SendCmd(tcp_cmd, "CONNECT", 5000) != ESP_OK)
+    if (ESP_SendCmd(tcp_cmd, "OK", 5000) != ESP_OK)
     {
-        Log_Write(LOG_WARN, "CIPSTART fail");
-        return 0;
+        /* 大概率是残留的僵尸连接：关掉再重试一次 */
+        ESP_SendCmd_OK("AT+CIPCLOSE\r\n", 1000);
+        vTaskDelay(1000);
+        if (ESP_SendCmd(tcp_cmd, "OK", 5000) != ESP_OK)
+        {
+            Log_Write(LOG_WARN, "CIPSTART fail");
+            return 0;
+        }
     }
     vTaskDelay(500);
 
@@ -122,7 +179,6 @@ void RE_MQTT_Init(void)
     if (MQTT_ConnectOnce())
     {
         g_mqtt_connected = 1;
-        connect = 1;
         Log_Write(LOG_INFO, "reconnect success");
     }
     else
