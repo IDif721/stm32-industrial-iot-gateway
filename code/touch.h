@@ -14,8 +14,8 @@
 #define LCD_LED_ON      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET)
 
 // ´¥ÃþÒý½Å
-#define TP_CS_SET       HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET)
-#define TP_CS_CLR       HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET)
+//#define TP_CS_SET       HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET)
+//#define TP_CS_CLR       HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET)
 
 // TOUCH
 #define TP_CS_SET       HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET)

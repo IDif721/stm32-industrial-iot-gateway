@@ -64,9 +64,9 @@ static uint8_t TP_IsPressed(void)
 {
     uint16_t z1 = TP_Read_AD(0xB1);
     uint16_t z2 = TP_Read_AD(0xC1);
-	char text[20];
-		sprintf(text,"z1=%d z2=%d\r\n",z1,z2);
-	HAL_UART_Transmit(&huart2,(uint8_t *)text,strlen(text),30);
+//	char text[20];
+//		sprintf(text,"z1=%d z2=%d\r\n",z1,z2);
+//	HAL_UART_Transmit(&huart2,(uint8_t *)text,strlen(text),30);
     
     // 常见触摸阈值：Z1 < 1000 或 Z2 < 1000 即认为按下（可微调）
     if (z1 >50 && z2 < 3000)  // 阈值根据实际触摸调试
