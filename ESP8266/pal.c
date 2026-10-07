@@ -16,159 +16,120 @@ extern uint8_t a[256];
 
 /* ESP8266 uart1 波特率115200 DMA空闲中断*/
 //+++正确退出透传后 下一条语句就不会输出error
-void MQTT_Init(void)
+
+/* ==================== 连接 ESP8266 并完成 MQTT 会话 ====================
+ * 首连 (MQTT_Init) 与断线重连 (RE_MQTT_Init) 共用本函数，保证两条路径行为一致。
+ * 返回 1 成功（已订阅主题），0 失败。
+ */
+static int MQTT_ConnectOnce(void)
 {
-
-	
-	  HAL_UART_Transmit(&huart1, (uint8_t *)"+++\r\n", 3, 100);
+    /* 1. 退出透传模式（若模块正在透传，AT 指令不会被识别） */
+    HAL_UART_Transmit(&huart1, (uint8_t *)"+++\r\n", 3, 100);
     vTaskDelay(1000);
-	
 
-    // 任意合法AT指令，完成模式切换（不操作TCP，安全无断连）
-    ESP_SendCmd_OK("AT\r\n", 2000);
-    vTaskDelay(200);
-	
+    /* 2. 等待 ESP8266 就绪：刚复位或刚上电时模块可能尚未启动完成 */
+    int ready = 0;
+    for (int i = 0; i < 5; i++)
+    {
+        if (ESP_SendCmd_OK("AT\r\n", 1000) == ESP_OK) { ready = 1; break; }
+        vTaskDelay(300);
+    }
+    if (!ready) { Log_Write(LOG_WARN, "AT no response"); return 0; }
+
+    /* 3. 关闭可能残留的旧连接，避免 CIPSTART 返回 ALREADY CONNECTED/ERROR */
+    ESP_SendCmd_OK("AT+CIPCLOSE\r\n", 1000);
+
+    /* 4. STA 模式 + 连接 WiFi */
     ESP_SendCmd_OK("AT+CWMODE=1\r\n", 2000);
     char wifi_cmd[64];
     sprintf(wifi_cmd, "AT+CWJAP=\"%s\",\"%s\"\r\n", WIFI_SSID, WIFI_PASS);
-    ESP_SendCmd(wifi_cmd, "WIFI GOT IP", 5000);
-		vTaskDelay(500);
-	
-    // 建立TCP连接
+    if (ESP_SendCmd(wifi_cmd, "WIFI GOT IP", 5000) != ESP_OK)
+    {
+        Log_Write(LOG_WARN, "CWJAP fail");   /* 不返回：模块可能已自动连上热点 */
+    }
+    vTaskDelay(500);
+
+    /* 5. 建立到巴法云的 TCP 连接 */
     char tcp_cmd[64];
     sprintf(tcp_cmd, "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", BEMFA_BROKER, BEMFA_PORT);
-    ESP_SendCmd(tcp_cmd, "CONNECT", 2000);
-		vTaskDelay(500);
-
-
-    // 进入透传模式
-    ESP_SendCmd_OK("AT+CIPMODE=1\r\n", 2000);
-		//启动透传
-		ESP_SendCmd("AT+CIPSEND\r\n", ">", 5000);
+    if (ESP_SendCmd(tcp_cmd, "CONNECT", 5000) != ESP_OK)
+    {
+        Log_Write(LOG_WARN, "CIPSTART fail");
+        return 0;
+    }
     vTaskDelay(500);
-    RingBuf_Clear();	
 
-uint8_t connect_packet[48] = {
-        0x10, 0x2E,                // 固定报头
-	
-        0x00,0x06,                 // 协议名长度 = 6 		可变报头
+    /* 6. 进入透传模式，准备发送 MQTT 报文 */
+    ESP_SendCmd_OK("AT+CIPMODE=1\r\n", 2000);
+    ESP_SendCmd("AT+CIPSEND\r\n", ">", 5000);
+    vTaskDelay(500);
+    RingBuf_Clear();
+
+    /* 7. 发送 MQTT CONNECT 报文（客户端 ID = 巴法云私钥） */
+    uint8_t connect_packet[48] = {
+        0x10, 0x2E,                    // 固定报头
+        0x00, 0x06,                    // 协议名长度 = 6
         0x4D,0x51,0x49,0x73,0x64,0x70, // 协议名: MQIsdp (MQTT v3.1)
-        0x03, 0x02, 0x00,0x78,     // 协议版本 + 连接标志 + 保活时间
-	
-        0x00,0x20,                 // 客户端ID长度 = 32     有效载荷
-};
-memcpy(&connect_packet[16], BEMFA_UID, sizeof(BEMFA_UID) - 1);   // 32字节 客户端唯一ID
-				// 串口发送整包
-				HAL_UART_Transmit(&huart1, connect_packet, sizeof(connect_packet), 5000);
-				vTaskDelay(300);
-	
-    // 解析CONNACK应答
+        0x03, 0x02, 0x00,0x78,         // 协议版本 + 连接标志 + 保活时间
+        0x00, 0x20,                    // 客户端 ID 长度 = 32
+    };
+    memcpy(&connect_packet[16], BEMFA_UID, sizeof(BEMFA_UID) - 1);
+    HAL_UART_Transmit(&huart1, connect_packet, sizeof(connect_packet), 5000);
+    vTaskDelay(300);
+
+    /* 8. 等待 CONNACK：0x20 0x02 xx 0x00 表示服务端接受连接 */
     uint8_t connack[4];
-		int ret = pal_tcp_recv_raw(0, connack, 4, 3000);			//读取缓冲区 对应字节数
-    if (ret == 4 && connack[0] == 0x20 && connack[1] == 0x02 && connack[3] == 0x00)
-    {     
-       
-        // 连接成功后 订阅主题
-		uint8_t sub_packet[] = {
-				0x82, 0x0A,          // 固定报头
-			
-				0x00, 0x01,          // 可变报头  报文标识符 Packet ID = 1
-			
-				0x00, 0x05,          // 有效载荷  主题名长度 = 5
-				0x00, 0x00, 0x00, 0x00, 0x00, // 主题名：由TOPIC_PUB填充
-				0x01                 // 订阅QoS等级 = 1
-		};
-		memcpy(&sub_packet[6], TOPIC_PUB, sizeof(TOPIC_PUB) - 1);
-		HAL_UART_Transmit(&huart1, sub_packet, sizeof(sub_packet), 5000);
-		vTaskDelay(300);
-		g_mqtt_connected = 1;
-		Log_Write(LOG_INFO, "CONNECT FINISH");
-				
-    } 
-    else 
+    int ret = pal_tcp_recv_raw(0, connack, 4, 3000);
+    if (!(ret == 4 && connack[0] == 0x20 && connack[1] == 0x02 && connack[3] == 0x00))
+    {
+        Log_Write(LOG_WARN, "no CONNACK");
+        return 0;
+    }
+
+    /* 9. 订阅主题 */
+    uint8_t sub_packet[] = {
+        0x82, 0x0A,                    // 固定报头
+        0x00, 0x01,                    // 可变报头  报文标识符 Packet ID = 1
+        0x00, 0x05,                    // 有效载荷  主题名长度 = 5
+        0x00, 0x00, 0x00, 0x00, 0x00,  // 主题名：由 TOPIC_PUB 填充
+        0x01                           // 订阅 QoS 等级 = 1
+    };
+    memcpy(&sub_packet[6], TOPIC_PUB, sizeof(TOPIC_PUB) - 1);
+    HAL_UART_Transmit(&huart1, sub_packet, sizeof(sub_packet), 5000);
+    vTaskDelay(300);
+
+    return 1;
+}
+
+/* 首次连接 */
+void MQTT_Init(void)
+{
+    if (MQTT_ConnectOnce())
+    {
+        g_mqtt_connected = 1;
+        Log_Write(LOG_INFO, "CONNECT FINISH");
+    }
+    else
+    {
+        g_mqtt_connected = 0;
+        Log_Write(LOG_WARN, "CONNECT FAIL");
+    }
+}
+
+/* 断线重连：复用与首连完全相同的连接流程 */
+void RE_MQTT_Init(void)
+{
+    if (MQTT_ConnectOnce())
+    {
+        g_mqtt_connected = 1;
+        connect = 1;
+        Log_Write(LOG_INFO, "reconnect success");
+    }
+    else
     {
         g_mqtt_connected = 0;
     }
 }
-
-void RE_MQTT_Init(void)
-{
-    HAL_UART_Transmit(&huart1, (uint8_t *)"+++\r\n", 3, 100);
-    vTaskDelay(1000);
-	for(int i=0;i<2;i++)
-	{
-		ESP_SendCmd_OK("AT+RST\r\n", 2000);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-	}
-	
-    ESP_SendCmd_OK("AT+CWMODE=1\r\n", 2000);
-    char wifi_cmd[64];
-    sprintf(wifi_cmd, "AT+CWJAP=\"%s\",\"%s\"\r\n", WIFI_SSID, WIFI_PASS);
-    ESP_SendCmd(wifi_cmd, "WIFI GOT IP", 5000);
-
-
-    // 建立TCP连接
-    char tcp_cmd[64];
-    sprintf(tcp_cmd, "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", BEMFA_BROKER, BEMFA_PORT);
-    ESP_SendCmd(tcp_cmd, "CONNECT", 5000);
-
-
-		ESP_SendCmd_OK("AT+CIPMODE=1\r\n", 2000);
-		ESP_SendCmd("AT+CIPSEND\r\n", ">", 5000);
-    vTaskDelay(500);
-    RingBuf_Clear();	
-
-    // MQTT 连接报文
-uint8_t connect_packet[48] = {
-        0x10, 0x2E,                // 固定报头
-	
-        0x00,0x06,                 // 协议名长度 = 6 		可变报头
-        0x4D,0x51,0x49,0x73,0x64,0x70, // 协议名: MQIsdp (MQTT v3.1)
-        0x03, 0x02, 0x00,0x78,     // 协议版本 + 连接标志 + 保活时间
-	
-        0x00,0x20,                 // 客户端ID长度 = 32     有效载荷
-};
-memcpy(&connect_packet[16], BEMFA_UID, sizeof(BEMFA_UID) - 1);   // 32字节 客户端唯一ID
-				// 串口发送整包
-				HAL_UART_Transmit(&huart1, connect_packet, sizeof(connect_packet), 5000);
-				vTaskDelay(300);   
-  
-		        // 解析CONNACK应答
-    uint8_t connack[4];
-    int ret = pal_tcp_recv_raw(0, connack, 4, 3000);
-		    
-    // 收到合法的 CONNACK（0x20 0x02 xx 0x00）才算连接成功
-    if (ret == 4 && connack[0] == 0x20 && connack[1] == 0x02 && connack[3] == 0x00)
-    {
-        // 连接成功后 订阅主题
-        uint8_t sub_packet[] = {
-            0x82, 0x0A,          // 固定报头
-            0x00, 0x01,          // 可变报头  报文标识符 Packet ID = 1
-            0x00, 0x05,          // 有效载荷  主题名长度 = 5
-            0x00, 0x00, 0x00, 0x00, 0x00, // 主题名：由TOPIC_PUB填充
-            0x01                 // 订阅QoS等级 = 1
-        };
-        memcpy(&sub_packet[6], TOPIC_PUB, sizeof(TOPIC_PUB) - 1);
-        HAL_UART_Transmit(&huart1, sub_packet, sizeof(sub_packet), 5000);
-        vTaskDelay(300);
-
-        g_mqtt_connected = 1;
-        connect = 1;
-        Log_Write(LOG_INFO, "reconnect success");
-        return;
-    }
-
-    // 重连失败：保持离线，等 AT 任务下个周期再重试
-    g_mqtt_connected = 0;
-
-
-
-		
-
-
-}
-
-
 
 // ==================== MQTT 心跳包 ====================
 void MQTT_SendPing(void)

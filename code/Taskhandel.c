@@ -136,7 +136,7 @@ xSemaphoreTake(uart1_mutex, portMAX_DELAY);				//获取锁
             {
                 // 离线缓存
                 char json[128];
-                sprintf(json, "{\"temperature\":%.1f,\"shidu\":%.1f}", data_q.temp, data_q.shi);
+                sprintf(json, "{\"temp\":%.1f,\"humi\":%.1f}", data_q.temp, data_q.shi);
 							HAL_GPIO_WritePin(GPIOB,GPIO_PIN_3,GPIO_PIN_SET);
                 FlashCache_Write(json, strlen(json));
             }

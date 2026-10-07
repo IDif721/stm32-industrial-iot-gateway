@@ -16,6 +16,7 @@
  * ================================================================ */
  
  extern QueueHandle_t     data_queue;
+extern QueueHandle_t lvgl_data_queue;
  extern UART_HandleTypeDef huart2;
 
 static const uint8_t auchCRCHi[] = {
@@ -257,14 +258,13 @@ void Modbus_Upload_Json(void)
     uidata.temp = dev_list[0].val1;
     uidata.shi = dev_list[0].val2;
     xQueueOverwrite(data_queue, &uidata);
+    xQueueOverwrite(lvgl_data_queue, &uidata);   // UI 队列：显示不再依赖 MQTT
 }
 
 
-extern QueueHandle_t lvgl_data_queue;   
 
 void MQTT_SendAllDev_NoWait(void)
 {
-		Data_t UIdat;
 	
     char payload[256]={0};
     int p=sprintf(payload,"{");
@@ -274,9 +274,7 @@ void MQTT_SendAllDev_NoWait(void)
         if(pt->dev_addr == 0x01 )
         {
             //01温湿度：温度、湿度
-            p += sprintf(payload+p,"{\"temp\":%.1f,\"humi\":%.1f,",pt->val1,pt->val2);
-						UIdat.temp=pt->val1;
-						UIdat.shi=pt->val2;
+            p += sprintf(payload+p,"\"temp\":%.1f,\"humi\":%.1f,",pt->val1,pt->val2);
         }
 //        else if(pt->dev_addr == 0x03)
 //        {
@@ -288,7 +286,6 @@ void MQTT_SendAllDev_NoWait(void)
     if(p>1)
         payload[p-1]='}';
 		
-		xQueueOverwrite(lvgl_data_queue, &UIdat);	//给ui写队列 覆盖写
 		//发布报文
     uint8_t buf[256];
     int pos = 0;
