@@ -137,34 +137,29 @@ memcpy(&connect_packet[16], BEMFA_UID, sizeof(BEMFA_UID) - 1);   // 32字节 客
     uint8_t connack[4];
     int ret = pal_tcp_recv_raw(0, connack, 4, 3000);
 		    
-    if (ret <1)
+    // 收到合法的 CONNACK（0x20 0x02 xx 0x00）才算连接成功
+    if (ret == 4 && connack[0] == 0x20 && connack[1] == 0x02 && connack[3] == 0x00)
     {
-			RingBuf_Clear();
-			for(int i=0;i<30;i++)
-			{
-				  HAL_UART_Transmit(&huart1, connect_packet, sizeof(connect_packet), 5000);
-					vTaskDelay(200);	
-			}
-	
         // 连接成功后 订阅主题
-		uint8_t sub_packet[] = {
-				0x82, 0x0A,          // 固定报头
-			
-				0x00, 0x01,          // 可变报头  报文标识符 Packet ID = 1
-			
-				0x00, 0x05,          // 有效载荷  主题名长度 = 5
-				0x00, 0x00, 0x00, 0x00, 0x00, // 主题名：由TOPIC_PUB填充
-				0x01                 // 订阅QoS等级 = 1
-		};
-		memcpy(&sub_packet[6], TOPIC_PUB, sizeof(TOPIC_PUB) - 1);
-		HAL_UART_Transmit(&huart1, sub_packet, sizeof(sub_packet), 5000);
-		vTaskDelay(300);
+        uint8_t sub_packet[] = {
+            0x82, 0x0A,          // 固定报头
+            0x00, 0x01,          // 可变报头  报文标识符 Packet ID = 1
+            0x00, 0x05,          // 有效载荷  主题名长度 = 5
+            0x00, 0x00, 0x00, 0x00, 0x00, // 主题名：由TOPIC_PUB填充
+            0x01                 // 订阅QoS等级 = 1
+        };
+        memcpy(&sub_packet[6], TOPIC_PUB, sizeof(TOPIC_PUB) - 1);
+        HAL_UART_Transmit(&huart1, sub_packet, sizeof(sub_packet), 5000);
+        vTaskDelay(300);
 
-				g_mqtt_connected = 1;
-				connect=1;
-				Log_Write(LOG_INFO, "reconnect success");
-				return ;
-			}
+        g_mqtt_connected = 1;
+        connect = 1;
+        Log_Write(LOG_INFO, "reconnect success");
+        return;
+    }
+
+    // 重连失败：保持离线，等 AT 任务下个周期再重试
+    g_mqtt_connected = 0;
 
 
 
