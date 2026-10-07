@@ -140,6 +140,7 @@ int main(void)
 	HAL_TIM_Base_Start_IT(&htim3);
 	HAL_IWDG_Init(&hiwdg);					//启动看门狗
 	
+	Flash_Mutex_Init();							//先建 Flash 互斥锁（必须早于 FlashCache_Init）
 	FlashCache_Init();  							//定位下一条数据的写入地址
 	RS485_RX;  
 	HAL_UARTEx_ReceiveToIdle_DMA(&huart1,a,sizeof(a));					//DMA接收空闲中断(ESP8266传数据到MCU 并放在环形缓冲区)	
@@ -153,7 +154,6 @@ data_queue = xQueueCreate(1, sizeof(Data_t));
 lvgl_data_queue= xQueueCreate(1, sizeof(Data_t));
 
 uart1_mutex =xSemaphoreCreateMutex();							//创建互斥锁 （谁上锁 谁才能开锁）
-flash_mutex=xSemaphoreCreateMutex();
 
  //Log_EraseAll();							// 偶尔要擦除日志区
 

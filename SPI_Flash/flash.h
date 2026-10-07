@@ -7,14 +7,14 @@
 #include "semphr.h"
 
 
-//分区封装Flash_Part_Write→BufferWrite→PageWrite，分层调用。
+//分区封装：对外接口(加锁)→分区读写(无锁)→BufferWrite→PageWrite，分层调用。
 
 // ===================== 1. W25Q64 分区定义（固定不变）=====================
 //设计优势：物理分区隔离，一个分区损坏不影响其他功能，符合工业设备设计规范。
 /*前4M日志区 后4M补传缓存区*/
 
 #define LOG_PART_ADDR       0x000000U  
-#define LOG_PART_SIZE       (0x400000U-1)								//日志
+#define LOG_PART_SIZE       (0x400000U)								//日志区大小 4MB（正好到缓存区起点，避免跨区写入）
 
 
 #define CACHE_START_ADDR    (4 * 1024 * 1024)					//补传缓冲区
@@ -55,8 +55,9 @@ typedef struct
 extern SemaphoreHandle_t flash_mutex;
 
 // ===================== 4. 分区通用读写接口（新增）=====================
-uint8_t Flash_Part_Read(uint32_t part_base, uint32_t offset, uint8_t *buf, uint16_t len);
-uint8_t Flash_Part_Write(uint32_t part_base, uint32_t offset, uint8_t *buf, uint16_t len);
+/* 分区读写已下沉为 flash.c 内部无锁实现（flash_part_read_nolock / flash_part_write_nolock），
+ * 不再对外暴露：外部直接调用会绕过 flash_mutex，破坏临界区。*/
+void Flash_Mutex_Init(void);          // 创建 Flash 互斥锁，必须在 FlashCache_Init() 之前调用
 
 // ===================== 5. 日志接口（新增）=====================
 void Log_Write(Log_Level level, const char *str);								//全工程通用日志写入入口
