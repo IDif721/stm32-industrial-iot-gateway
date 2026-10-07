@@ -10,8 +10,6 @@ void AT();
 void UI();
 void Modbus();
 void page_log_refresh(void);
-extern  volatile uint8_t connect;
-
 // 温湿度数据结构体
 
 typedef struct {

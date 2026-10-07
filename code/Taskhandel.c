@@ -44,7 +44,6 @@ uint32_t last_ping = 0;
 
 extern IWDG_HandleTypeDef hiwdg;
  volatile uint8_t g_mqtt_connected;
-volatile uint8_t connect;
 
 // ==============================================
 // Modbus 采集
@@ -176,25 +175,18 @@ void AT(void)
             {
                 // 心跳正常
                 heart_fail = 0;
-							connect=0;
-						
             }
             else							// 心跳超时或数据错误
             {
-                
-							if(connect==0)
-							{
                 heart_fail++;
                 if (heart_fail >= 3)  // 连续 3 次失败，约 30 秒
                 {
                     g_mqtt_connected = 0;					//断网
-										Log_Write(LOG_WARN, "MQTT disconnect");
-										HAL_GPIO_WritePin(GPIOB,GPIO_PIN_3,GPIO_PIN_SET);
-										HAL_GPIO_WritePin(GPIOA,GPIO_PIN_15,GPIO_PIN_RESET);
+                    Log_Write(LOG_WARN, "MQTT disconnect");
+                    HAL_GPIO_WritePin(GPIOB,GPIO_PIN_3,GPIO_PIN_SET);
+                    HAL_GPIO_WritePin(GPIOA,GPIO_PIN_15,GPIO_PIN_RESET);
                     heart_fail = 0;
-									  
                 }
-							}
             }
         }
 				else
