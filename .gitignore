@@ -1,0 +1,67 @@
+# =====================================================================
+#  .gitignore  -  工业边缘网关监控 (STM32F411 + FreeRTOS + LVGL)
+#  忽略：编译产物、IDE 临时文件、操作系统垃圾文件、本地隐私配置
+# =====================================================================
+
+# ---------- Keil MDK-ARM 编译输出目录 ----------
+# F4project 目录下全部是 .o/.d/.crf/.axf 等编译产物（700+ 文件）
+MDK-ARM/F4project/
+MDK-ARM/Objects/
+MDK-ARM/Listings/
+Objects/
+Listings/
+
+# ---------- Keil MDK-ARM 编译产物（按扩展名）----------
+*.o
+*.d
+*.crf
+*.dep
+*.lnp
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.htm
+*.build_log.htm
+*.iex
+*.sct
+*.i
+*.l
+*.__i
+*.bak
+*.tmp
+*.obj
+*.exe
+
+# ---------- Keil 用户界面/调试个性化设置（因人而异，不入库）----------
+*.uvguix.*
+JLinkLog.txt
+JLinkSettings.ini
+
+# ---------- 编辑器 / IDE ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---------- 操作系统垃圾文件 ----------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+._*
+
+# ---------- 本地隐私配置（含 WiFi 密码 / 云平台私钥，禁止入库）----------
+# 说明：真实凭据放在本文件里，仓库中只提交 .example 模板
+ESP8266/pal_secrets.h
+ESP8266/pal_config.h
+
+# ---------- LVGL 示例资源 ----------
+# Lvgl/demos/ 本工程未编译（约 57MB），忽略以减小仓库体积。
+# 注意：Lvgl/examples/porting/ 含本工程必需的 lv_port_disp / lv_port_indev 移植文件，
+#       必须入库，所以 Lvgl/examples/ 不能忽略。
+Lvgl/demos/
